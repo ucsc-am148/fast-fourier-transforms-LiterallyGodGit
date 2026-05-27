@@ -39,18 +39,9 @@ TRANSPOSE_BLOCK = 32
 
 @triton.jit
 def _cdot(a_re, a_im, b_re, b_im):
-    """Complex matmul Y = A @ B as four real tl.dot calls.
-
-    Returns (y_re, y_im) in fp32 (out_dtype=tl.float32). Caller is responsible
-    for any fp16 down-cast on store. Works at any matmul shape tl.dot accepts.
-
-    Used by f1_kernel, f4_kernel_L2, and dft_kernel. Don't reimplement the
-    four-tl.dot expansion at each call site -- implement once here, call
-    everywhere.
-
-    TODO: implement.
-    """
-    pass
+    y_re = tl.dot(a_re, b_re, out_dtype=tl.float32) - tl.dot(a_im, b_im, out_dtype=tl.float32)
+    y_im = tl.dot(a_re, b_im, out_dtype=tl.float32) + tl.dot(a_im, b_re, out_dtype=tl.float32)
+    return y_re, y_im
 
 
 # =============================================================================
@@ -58,17 +49,16 @@ def _cdot(a_re, a_im, b_re, b_im):
 # =============================================================================
 
 def f6_factor(N: int) -> list[int]:
-    """Factor N = 2^k into FFT chunks.
-
-    Recipe: prefer 256-length chunks (radix-256, handled by f4_kernel_L2), then
-    16-length (handled by dft_kernel via the padded radix-16 path), then a
-    small leftover in {2, 4, 8} for the remaining bits. chunks[0] is the
-    innermost (fastest) input axis. Examples:
-        256 -> [256]                4096 -> [256, 16]
-        65536 -> [256, 256]         1048576 -> [256, 256, 16]
-        64 -> [16, 4]               2 -> [2]
-    """
-    raise NotImplementedError("TODO: implement f6_factor")
+    chunks = []
+    while N % 256 == 0:
+        chunks.append(256)
+        N //= 256
+    while N % 16 == 0:
+        chunks.append(16)
+        N //= 16
+    if N > 1:
+        chunks.append(N)  # leftover in {2, 4, 8}
+    return chunks
 
 
 f7_factor = f6_factor   # F7 reuses F6's chunk recipe
@@ -89,32 +79,59 @@ def f1_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Y = X @ W^T as four (BLOCK_M, BLOCK_K) x (BLOCK_K, BLOCK_N) tl.dot calls.
+    pid_m = tl.program_id(0)  # batch tile
+    pid_n = tl.program_id(1)  # output col tile
 
-    Y[b, n] = sum_k X[b, k] * W[n, k]. Load W in transposed access
-    (W_T[k, n] = W[n, k]) so tl.dot reads it the way it wants.
+    # Row/col ranges for this program
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # (BLOCK_M,)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # (BLOCK_N,)
 
-    Use `_cdot(x_re, x_im, W_T_re, W_T_im)` for the per-block complex matmul;
-    accumulate its fp32 output into `acc_re` / `acc_im`.
+    acc_re = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_im = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    Dtype contract (same as F4): loads are fp16, `tl.dot` runs with
-    `out_dtype=tl.float32` (handled by `_cdot`), accumulator is fp32, store
-    is fp32. Allocations in `f1_alloc` already match this -- x_re/x_im are
-    fp16, y_re/y_im are fp32.
+    for k_start in range(0, N, BLOCK_K):
+        ks = k_start + tl.arange(0, BLOCK_K)  # (BLOCK_K,)
 
-    TODO: implement.
-    """
-    pass
+        # Load X tile: (BLOCK_M, BLOCK_K)
+        x_mask = (rows[:, None] < B) & (ks[None, :] < N)
+        x_off  = rows[:, None] * N + ks[None, :]
+        x_re   = tl.load(x_re_ptr + x_off, mask=x_mask, other=0.0).to(tl.float16)
+        x_im   = tl.load(x_im_ptr + x_off, mask=x_mask, other=0.0).to(tl.float16)
+
+        # Load W^T tile: W_T[k, n] = W[n, k] -> shape (BLOCK_K, BLOCK_N)
+        w_mask = (cols[None, :] < N) & (ks[:, None] < N)
+        w_off  = cols[None, :] * N + ks[:, None]   # W[n, k] -> transposed access
+        w_re   = tl.load(W_re_ptr + w_off, mask=w_mask, other=0.0).to(tl.float16)
+        w_im   = tl.load(W_im_ptr + w_off, mask=w_mask, other=0.0).to(tl.float16)
+
+        # Complex matmul tile and accumulate
+        t_re, t_im = _cdot(x_re, x_im, w_re, w_im)
+        acc_re += t_re
+        acc_im += t_im
+
+    # Store fp32 output
+    out_mask = (rows[:, None] < B) & (cols[None, :] < N)
+    out_off  = rows[:, None] * N + cols[None, :]
+    tl.store(y_re_ptr + out_off, acc_re, mask=out_mask)
+    tl.store(y_im_ptr + out_off, acc_im, mask=out_mask)
 
 
 def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
-    """Grid: (cdiv(B, BLOCK_M), cdiv(N, BLOCK_N)). One program tiles a
-    (BLOCK_M, BLOCK_N) output square. tl.dot needs all three dims >=16, so B
-    should be >= 16.
-
-    TODO: implement.
-    """
-    raise NotImplementedError("TODO: implement f1_launch")
+    B, N = x_re.shape
+    BLOCK_M = 16
+    BLOCK_K = 16
+    BLOCK_N = 16
+    grid = ((B + BLOCK_M - 1) // BLOCK_M, (N + BLOCK_N - 1) // BLOCK_N)
+    f1_kernel[grid](
+        x_re, x_im,
+        W_re, W_im,
+        y_re, y_im,
+        B,
+        N=N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=BLOCK_N,
+    )
 
 
 # =============================================================================
