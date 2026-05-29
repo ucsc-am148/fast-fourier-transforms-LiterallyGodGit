@@ -101,10 +101,42 @@ def f1_kernel(
     `out_dtype=tl.float32` (handled by `_cdot`), accumulator is fp32, store
     is fp32. Allocations in `f1_alloc` already match this -- x_re/x_im are
     fp16, y_re/y_im are fp32.
-
-    TODO: implement.
     """
-    pass
+    pid_m = tl.program_id(0)  # batch tile
+    pid_n = tl.program_id(1)  # output col tile
+
+    # Row/col ranges for this program
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # (BLOCK_M,)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # (BLOCK_N,)
+
+    acc_re = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_im = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, N, BLOCK_K):
+        ks = k_start + tl.arange(0, BLOCK_K)  # (BLOCK_K,)
+
+        # Load X tile: (BLOCK_M, BLOCK_K)
+        x_mask = (rows[:, None] < B) & (ks[None, :] < N)
+        x_off  = rows[:, None] * N + ks[None, :]
+        x_re   = tl.load(x_re_ptr + x_off, mask=x_mask, other=0.0).to(tl.float16)
+        x_im   = tl.load(x_im_ptr + x_off, mask=x_mask, other=0.0).to(tl.float16)
+
+        # Load W^T tile: W_T[k, n] = W[n, k] -> shape (BLOCK_K, BLOCK_N)
+        w_mask = (cols[None, :] < N) & (ks[:, None] < N)
+        w_off  = cols[None, :] * N + ks[:, None]   # W[n, k] -> transposed access
+        w_re   = tl.load(W_re_ptr + w_off, mask=w_mask, other=0.0).to(tl.float16)
+        w_im   = tl.load(W_im_ptr + w_off, mask=w_mask, other=0.0).to(tl.float16)
+
+        # Complex matmul tile and accumulate
+        t_re, t_im = _cdot(x_re, x_im, w_re, w_im)
+        acc_re += t_re
+        acc_im += t_im
+
+    # Store fp32 output
+    out_mask = (rows[:, None] < B) & (cols[None, :] < N)
+    out_off  = rows[:, None] * N + cols[None, :]
+    tl.store(y_re_ptr + out_off, acc_re, mask=out_mask)
+    tl.store(y_im_ptr + out_off, acc_im, mask=out_mask)
 
 
 def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
