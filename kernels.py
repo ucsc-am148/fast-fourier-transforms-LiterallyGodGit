@@ -133,6 +133,7 @@ def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
         BLOCK_N=BLOCK_N,
     )
 
+
 # =============================================================================
 # F2: radix-2 Cooley-Tukey, single program per signal
 # =============================================================================
@@ -157,8 +158,8 @@ def f2_kernel(
     x_re_ptr, x_im_ptr,        # (B, N) fp32 input
     y_re_ptr, y_im_ptr,        # (B, N) fp32 output (layout depends on STRIDED_STORE)
     tw_re_ptr, tw_im_ptr,      # (N/2,) fp32 radix-2 twiddles
-    perm_ptr,                   # (N,) int32 bit-reversal index
-    bt_re_ptr, bt_im_ptr,       # (OUTER_DIM, N) fp32 Bailey twiddles (BAILEY_EPILOGUE only)
+    perm_ptr,                  # (N,) int32 bit-reversal index
+    bt_re_ptr, bt_im_ptr,      # (OUTER_DIM, N) fp32 Bailey twiddles (BAILEY_EPILOGUE only)
     OUTER_DIM, N_TOTAL,
     N: tl.constexpr,
     LOG2_N: tl.constexpr,
@@ -167,18 +168,91 @@ def f2_kernel(
 ):
     """Radix-2 Cooley-Tukey FFT in registers, with optional Bailey epilogue and
     strided store. log2(N) butterfly stages via tl.gather for partner shuffle.
-
-    TODO: implement.
     """
-    pass
+    pid = tl.program_id(0)
+    base = pid * N
+    js = tl.arange(0, N)
+
+    # Load bit-reversed input into registers
+    rev = tl.load(perm_ptr + js)
+    v_re = tl.load(x_re_ptr + base + rev)
+    v_im = tl.load(x_im_ptr + base + rev)
+
+    # log2(N) butterfly stages
+    for s in tl.static_range(LOG2_N):
+        half = 1 << s
+        mask = half - 1
+        step = N >> (s + 1)
+
+        # Partner of j is j XOR 2^s
+        partner = js ^ half
+        # Twiddle index is the same for j and its partner (mask strips bit s)
+        tw_idx = (js & mask) * step
+        tw_re_val = tl.load(tw_re_ptr + tw_idx)
+        tw_im_val = tl.load(tw_im_ptr + tw_idx)
+
+        # Gather partner values from registers
+        gather_re = tl.gather(v_re, partner, 0)
+        gather_im = tl.gather(v_im, partner, 0)
+
+        # lower = element with bit s clear, upper = element with bit s set
+        is_upper = (js & half) != 0
+        lower_re = tl.where(is_upper, gather_re, v_re)
+        lower_im = tl.where(is_upper, gather_im, v_im)
+        upper_re = tl.where(is_upper, v_re,      gather_re)
+        upper_im = tl.where(is_upper, v_im,      gather_im)
+
+        # Complex twiddle multiply: w * upper
+        wp_re = tw_re_val * upper_re - tw_im_val * upper_im
+        wp_im = tw_re_val * upper_im + tw_im_val * upper_re
+
+        # Butterfly: lower element gets +, upper element gets -
+        v_re = tl.where(is_upper, lower_re - wp_re, lower_re + wp_re)
+        v_im = tl.where(is_upper, lower_im - wp_im, lower_im + wp_im)
+
+    # Bailey epilogue (F2-A): multiply output by cross-twiddle bt[n1, k2]
+    if BAILEY_EPILOGUE:
+        n1 = pid % OUTER_DIM
+        bt_re_val = tl.load(bt_re_ptr + n1 * N + js)
+        bt_im_val = tl.load(bt_im_ptr + n1 * N + js)
+        new_re = v_re * bt_re_val - v_im * bt_im_val
+        new_im = v_re * bt_im_val + v_im * bt_re_val
+        v_re = new_re
+        v_im = new_im
+
+    # Store output
+    if STRIDED_STORE:
+        # F2-B: write v[k1] to y[b, k1, k2] in (B, N1, N2) layout
+        # pid = b*OUTER_DIM + k2
+        k2    = pid % OUTER_DIM
+        b_idx = pid // OUTER_DIM
+        out_idx = b_idx * N_TOTAL + js * OUTER_DIM + k2
+        tl.store(y_re_ptr + out_idx, v_re)
+        tl.store(y_im_ptr + out_idx, v_im)
+    else:
+        tl.store(y_re_ptr + base + js, v_re)
+        tl.store(y_im_ptr + base + js, v_im)
 
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
-    """Grid: (B,). One program per length-N signal. Vanilla mode.
-
-    TODO: implement.
-    """
-    raise NotImplementedError("TODO: implement f2_launch")
+    """Grid: (B,). One program per length-N signal. Vanilla mode."""
+    B, N = x_re.shape
+    LOG2_N = int(math.log2(N))
+    f2_kernel[(B,)](
+        x_re, 
+        x_im,
+        y_re, 
+        y_im,
+        tw_re, 
+        tw_im,
+        perm,
+        tw_re, tw_im,           # sentinel for bt_*_ptr (BAILEY_EPILOGUE=False, never read)
+        1, 0,                   # OUTER_DIM=1, N_TOTAL=0 (unused in vanilla mode)
+        N=N,
+        LOG2_N=LOG2_N,
+        BAILEY_EPILOGUE=False,
+        STRIDED_STORE=False,
+    )
 
 
 # =============================================================================
@@ -195,10 +269,24 @@ def transpose_kernel(
 ):
     """Logical (B, R, C) -> (B, C, R) transpose. Grid: (cdiv(R, BLOCK_R),
     cdiv(C, BLOCK_C), B). Each program copies a (BLOCK_R, BLOCK_C) tile.
-
-    TODO: implement.
     """
-    pass
+    pid_r = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    rs = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)   # (BLOCK_R,)
+    cs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)   # (BLOCK_C,)
+
+    # Load tile from x[b, r, c] = b*R*C + r*C + c
+    x_off = pid_b * R * C + rs[:, None] * C + cs[None, :]   # (BLOCK_R, BLOCK_C)
+    mask  = (rs[:, None] < R) & (cs[None, :] < C)
+    tile_re = tl.load(x_re_ptr + x_off, mask=mask)
+    tile_im = tl.load(x_im_ptr + x_off, mask=mask)
+
+    # Store to y[b, c, r] = b*C*R + c*R + r
+    y_off = pid_b * R * C + cs[None, :] * R + rs[:, None]   # (BLOCK_R, BLOCK_C)
+    tl.store(y_re_ptr + y_off, tile_re, mask=mask)
+    tl.store(y_im_ptr + y_off, tile_im, mask=mask)
 
 
 # =============================================================================
