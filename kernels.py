@@ -465,9 +465,51 @@ def f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B):
       3. T2 (transpose): Z[b, n1, k2] -> Z'[b, k2, n1]
       4. F2-B:           length-N1 FFT over (B*N2) signals with strided store
 
-    TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f3_launch")
+    N1 = plan['N1']
+    N2 = plan['N2']
+
+    # Step 1: T1 — (B, N2, N1) -> (B, N1, N2)
+    _transpose(in_re, in_im, mid_re, mid_im, B, N2, N1)
+
+    # Step 2: F2-A — length-N2 FFT over B*N1 signals + Bailey epilogue (fused Scale)
+    f2_kernel[(B * N1,)](
+        mid_re, mid_im,
+        out_re, out_im,
+        plan['tw_re_n2'], 
+        plan['tw_im_n2'],
+        plan['perm_n2'],
+        plan['bt_re'], 
+        plan['bt_im'],
+        N1, 
+        0,
+        N=N2, 
+        LOG2_N=plan['LOG2_N2'],
+        BAILEY_EPILOGUE=True, 
+        STRIDED_STORE=False,
+    )
+
+    # Step 3: T2 — (B, N1, N2) -> (B, N2, N1)
+    _transpose(out_re, out_im, mid_re, mid_im, B, N1, N2)
+
+    # Step 4: F2-B — length-N1 FFT over B*N2 signals + strided store (fused T3)
+    f2_kernel[(B * N2,)](
+        mid_re, 
+        mid_im,
+        out_re, 
+        out_im,
+        plan['tw_re_n1'], 
+        plan['tw_im_n1'],
+        plan['perm_n1'],
+        plan['tw_re_n1'], 
+        plan['tw_im_n1'],  # sentinel (BAILEY_EPILOGUE=False)
+        N2, 
+        N1 * N2,
+        N=N1, 
+        LOG2_N=plan['LOG2_N1'],
+        BAILEY_EPILOGUE=False, 
+        STRIDED_STORE=True,
+    )
 
 
 # =============================================================================
