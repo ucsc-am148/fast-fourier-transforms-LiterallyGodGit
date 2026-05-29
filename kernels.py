@@ -336,10 +336,92 @@ def f4_kernel_L2(
         perm = (1, 0, 2); tl.permute(x, perm)     # fails
     Inline each stage's permute tuple at the call site; don't store the
     schedule in a loop variable.
-
-    TODO: implement.
     """
-    pass
+    pid = tl.program_id(0)
+    bs = pid * BLOCK_B + tl.arange(0, BLOCK_B)  # (BLOCK_B,) batch indices
+    ns = tl.arange(0, 256)
+    fi = tl.arange(0, 16)
+
+    # Load (BLOCK_B, 256) fp16
+    bmask = bs[:, None] < B
+    x_re = tl.load(x_re_ptr + bs[:, None] * 256 + ns[None, :], mask=bmask, other=0.0).to(tl.float16)
+    x_im = tl.load(x_im_ptr + bs[:, None] * 256 + ns[None, :], mask=bmask, other=0.0).to(tl.float16)
+
+    # Reshape to (BLOCK_B, 16, 16) = (B, d0, d1)
+    x_re = tl.reshape(x_re, (BLOCK_B, 16, 16))
+    x_im = tl.reshape(x_im, (BLOCK_B, 16, 16))
+
+    # Load F_16 DFT matrix (16, 16) fp16
+    F_re = tl.load(F_re_ptr + fi[:, None] * 16 + fi[None, :]).to(tl.float16)
+    F_im = tl.load(F_im_ptr + fi[:, None] * 16 + fi[None, :]).to(tl.float16)
+
+    # ---- Stage 0: identity permute, no twiddle, DFT on d0 ----
+    # Batched DFT trick: (B, d0, d1) -> permute(1,0,2) -> (d0, B, d1)
+    #                    -> reshape(16, B*16) -> F @ x -> reshape(16, B, 16)
+    #                    -> permute(1,0,2) -> (B, e1, d1)
+    x_re = tl.permute(x_re, (1, 0, 2))
+    x_im = tl.permute(x_im, (1, 0, 2))
+    x_re = tl.reshape(x_re, (16, BLOCK_B * 16))
+    x_im = tl.reshape(x_im, (16, BLOCK_B * 16))
+    y_re, y_im = _cdot(F_re, F_im, x_re, x_im)
+    y_re = y_re.to(tl.float16)
+    y_im = y_im.to(tl.float16)
+    y_re = tl.reshape(y_re, (16, BLOCK_B, 16))
+    y_im = tl.reshape(y_im, (16, BLOCK_B, 16))
+    x_re = tl.permute(y_re, (1, 0, 2))   # (B, e1, d1)
+    x_im = tl.permute(y_im, (1, 0, 2))
+
+    if STAGE_STOP > 1:
+        # ---- Stage 1: permute(0,2,1), twiddle tw[1], DFT on d1 ----
+
+        # Stage permute: (B, e1, d1) -> (B, d1, e1)
+        x_re = tl.permute(x_re, (0, 2, 1))
+        x_im = tl.permute(x_im, (0, 2, 1))
+
+        # Reshape for DFT: (B, d1, e1) -> permute(1,0,2) -> (d1, B, e1) -> (16, B*16)
+        x_re = tl.permute(x_re, (1, 0, 2))
+        x_im = tl.permute(x_im, (1, 0, 2))
+        x_re = tl.reshape(x_re, (16, BLOCK_B * 16))
+        x_im = tl.reshape(x_im, (16, BLOCK_B * 16))
+
+        # Load stage-1 twiddle as (16, BLOCK_B*16): tile tw[d1, e1] along B axis
+        col_idx = tl.arange(0, BLOCK_B * 16)
+        tw_off = 1 * 16 * 16 + fi[:, None] * 16 + (col_idx % 16)[None, :]
+        tw_re = tl.load(tw_re_ptr + tw_off).to(tl.float16)
+        tw_im = tl.load(tw_im_ptr + tw_off).to(tl.float16)
+
+        # Elementwise complex multiply: fp32 arithmetic, fp16 result
+        xr = x_re.to(tl.float32)
+        xi = x_im.to(tl.float32)
+        x_re = (xr * tw_re.to(tl.float32) - xi * tw_im.to(tl.float32)).to(tl.float16)
+        x_im = (xr * tw_im.to(tl.float32) + xi * tw_re.to(tl.float32)).to(tl.float16)
+
+        # DFT: F @ x_flat -> reshape back to (B, e0, e1)
+        y_re, y_im = _cdot(F_re, F_im, x_re, x_im)
+        y_re = y_re.to(tl.float16)
+        y_im = y_im.to(tl.float16)
+        y_re = tl.reshape(y_re, (16, BLOCK_B, 16))
+        y_im = tl.reshape(y_im, (16, BLOCK_B, 16))
+        x_re = tl.permute(y_re, (1, 0, 2))   # (B, e0, e1)
+        x_im = tl.permute(y_im, (1, 0, 2))
+
+    # Reshape to (BLOCK_B, 256)
+    x_re = tl.reshape(x_re, (BLOCK_B, 256))
+    x_im = tl.reshape(x_im, (BLOCK_B, 256))
+
+    # Store
+    out_mask = bs[:, None] < B
+    if STORE_T:
+        # Transposed layout (B//M, 256, M): y[b//M, k, b%M]
+        b_outer = bs // M
+        b_inner = bs % M
+        out_off = b_outer[:, None] * 256 * M + ns[None, :] * M + b_inner[:, None]
+        tl.store(y_re_ptr + out_off, x_re, mask=out_mask)
+        tl.store(y_im_ptr + out_off, x_im, mask=out_mask)
+    else:
+        out_off = bs[:, None] * 256 + ns[None, :]
+        tl.store(y_re_ptr + out_off, x_re, mask=out_mask)
+        tl.store(y_im_ptr + out_off, x_im, mask=out_mask)
 
 
 # =============================================================================
