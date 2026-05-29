@@ -146,8 +146,21 @@ def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f1_launch")
-
+    B, N = x_re.shape
+    BLOCK_M = 16
+    BLOCK_K = 16
+    BLOCK_N = 16
+    grid = ((B + BLOCK_M - 1) // BLOCK_M, (N + BLOCK_N - 1) // BLOCK_N)
+    f1_kernel[grid](
+        x_re, x_im,
+        W_re, W_im,
+        y_re, y_im,
+        B,
+        N=N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=BLOCK_N,
+    )
 
 # =============================================================================
 # F2: radix-2 Cooley-Tukey, single program per signal
