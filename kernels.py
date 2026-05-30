@@ -443,10 +443,38 @@ def dft_kernel(
 
     One `_cdot(x_re, x_im, MT_re, MT_im)` call replaces the four `tl.dot`
     expansions; cast its fp32 result to fp16 on store.
-
-    TODO: implement.
     """
-    pass
+    pid = tl.program_id(0)
+    bs = pid * BLOCK_B + tl.arange(0, BLOCK_B) # (BLOCK_B,) row indices
+    ns = tl.arange(0, 16)                      # input/output position [0,16)
+
+    # Load (BLOCK_B, R) padded to (BLOCK_B, 16); positions >= R fill with 0
+    load_mask = (bs[:, None] < rows) & (ns[None, :] < R)
+    x_re = tl.load(x_re_ptr + bs[:, None] * R + ns[None, :], mask=load_mask, other=0.0).to(tl.float16)
+    x_im = tl.load(x_im_ptr + bs[:, None] * R + ns[None, :], mask=load_mask, other=0.0).to(tl.float16)
+
+    # Load padded DFT matrix (16, 16) — columns >= R are already zeroed by make_dft_R_padded
+    M_re = tl.load(M_re_ptr + ns[:, None] * 16 + ns[None, :]).to(tl.float16)
+    M_im = tl.load(M_im_ptr + ns[:, None] * 16 + ns[None, :]).to(tl.float16)
+
+    # DFT: Y = x @ M_mat  (BLOCK_B, 16) @ (16, 16) -> (BLOCK_B, 16)
+    y_re, y_im = _cdot(x_re, x_im, M_re, M_im)
+    y_re = y_re.to(tl.float16)
+    y_im = y_im.to(tl.float16)
+
+    # Store first R columns
+    out_mask = (bs[:, None] < rows) & (ns[None, :] < R)
+    if STORE_T:
+        # Transposed layout (rows//M, R, M): y[b//M, k, b%M]
+        b_outer = bs // M
+        b_inner = bs % M
+        out_off = b_outer[:, None] * R * M + ns[None, :] * M + b_inner[:, None]
+        tl.store(y_re_ptr + out_off, y_re, mask=out_mask)
+        tl.store(y_im_ptr + out_off, y_im, mask=out_mask)
+    else:
+        out_off = bs[:, None] * R + ns[None, :]
+        tl.store(y_re_ptr + out_off, y_re, mask=out_mask)
+        tl.store(y_im_ptr + out_off, y_im, mask=out_mask)
 
 
 # =============================================================================
@@ -468,10 +496,35 @@ def bailey_scale_kernel(
     produce (rows, M, m0).
 
     Grid: (cdiv(m0, BLOCK_M0), cdiv(M, BLOCK_M), rows).
-
-    TODO: implement.
     """
-    pass
+    pid0 = tl.program_id(0)   # m0 tile
+    pid1 = tl.program_id(1)   # M tile
+    row  = tl.program_id(2)   # batch row
+
+    i0 = pid0 * BLOCK_M0 + tl.arange(0, BLOCK_M0)   # (BLOCK_M0,)
+    j0 = pid1 * BLOCK_M  + tl.arange(0, BLOCK_M)    # (BLOCK_M,)
+    mask = (i0[:, None] < m0) & (j0[None, :] < M)
+
+    # Load x[row, i, j] and twiddle tw[i, j]
+    x_off  = row * m0 * M + i0[:, None] * M + j0[None, :]
+    tw_off = i0[:, None] * M + j0[None, :]
+    x_re = tl.load(x_re_ptr + x_off,  mask=mask).to(tl.float32)
+    x_im = tl.load(x_im_ptr + x_off,  mask=mask).to(tl.float32)
+    tw_re = tl.load(tw_re_ptr + tw_off, mask=mask).to(tl.float32)
+    tw_im = tl.load(tw_im_ptr + tw_off, mask=mask).to(tl.float32)
+
+    # Complex multiply: fp32 arithmetic, fp16 result
+    y_re = (x_re * tw_re - x_im * tw_im).to(tl.float16)
+    y_im = (x_re * tw_im + x_im * tw_re).to(tl.float16)
+
+    if STORE_T:
+        # Fused transpose: write y[row, j, i] for (rows, M, m0) layout
+        y_off = row * M * m0 + j0[None, :] * m0 + i0[:, None]
+        tl.store(y_re_ptr + y_off, y_re, mask=mask)
+        tl.store(y_im_ptr + y_off, y_im, mask=mask)
+    else:
+        tl.store(y_re_ptr + x_off, y_re, mask=mask)
+        tl.store(y_im_ptr + x_off, y_im, mask=mask)
 
 
 # =============================================================================
@@ -613,9 +666,27 @@ def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
       5. FFT-B: length-256 FFT along last axis -> V[b, k2, k1]
       6. T3:    V[b, k2, k1] -> X[b, k1, k2]   (final in b0)
 
-    TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f5_launch")
+    N1 = plan['N1']   # 256
+    N2 = plan['N2']   # 256
+
+    # Step 1: T1 — (B, N2, N1) -> (B, N1, N2)
+    _transpose(in_re, in_im, b0_re, b0_im, B, N2, N1)
+
+    # Step 2: FFT-A — B*N1 length-N2 FFTs along last axis
+    _fft_chunk(b0_re, b0_im, b1_re, b1_im, B * N1, N2, plan)
+
+    # Step 3: Scale — Z[b, n1, k2] = Y[b, n1, k2] * bt[n1, k2]
+    _scale(b1_re, b1_im, b0_re, b0_im, B, N1, N2, plan['bt_re'], plan['bt_im'])
+
+    # Step 4: T2 — (B, N1, N2) -> (B, N2, N1)
+    _transpose(b0_re, b0_im, b1_re, b1_im, B, N1, N2)
+
+    # Step 5: FFT-B — B*N2 length-N1 FFTs along last axis
+    _fft_chunk(b1_re, b1_im, b2_re, b2_im, B * N2, N1, plan)
+
+    # Step 6: T3 — (B, N2, N1) -> (B, N1, N2), final lands in b0
+    _transpose(b2_re, b2_im, b0_re, b0_im, B, N2, N1)
 
 
 # =============================================================================
