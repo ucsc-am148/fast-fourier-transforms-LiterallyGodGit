@@ -705,18 +705,62 @@ def _f6_rec(cur_re, cur_im, rows, chunks, plan, cyc):
     _fft_chunk call; non-leaf is the 6-step pipeline above.
 
     Returns the (re, im) cycler-managed buffers holding the (rows, prod(chunks))
-    FFT result.
-
-    TODO: implement.
+    FFT result. Input cur is in (rows, M, m0) layout; output is (rows, m0, M).
     """
-    raise NotImplementedError("TODO: implement _f6_rec")
+    m0 = chunks[0]
+    if len(chunks) == 1:
+        out_re, out_im = cyc.next()
+        _fft_chunk(cur_re, cur_im, out_re, out_im, rows, m0, plan)
+        return out_re, out_im
+
+    M = math.prod(chunks[1:])
+    N_i = m0 * M
+
+    t1_re, t1_im = cyc.next()
+    _transpose(cur_re, cur_im, t1_re, t1_im, rows, M, m0)
+
+    rec_re, rec_im = _f6_rec(t1_re, t1_im, rows * m0, chunks[1:], plan, cyc)
+
+    twr, twi = _lookup_tw(plan, m0, M, N_i)
+    sc_re, sc_im = cyc.next()
+    _scale(rec_re, rec_im, sc_re, sc_im, rows, m0, M, twr, twi)
+
+    t2_re, t2_im = cyc.next()
+    _transpose(sc_re, sc_im, t2_re, t2_im, rows, m0, M)
+
+    fft_re, fft_im = cyc.next()
+    _fft_chunk(t2_re, t2_im, fft_re, fft_im, rows * M, m0, plan)
+
+    t3_re, t3_im = cyc.next()
+    _transpose(fft_re, fft_im, t3_re, t3_im, rows, M, m0)
+
+    return t3_re, t3_im
 
 
 def _f7_rec(cur_re, cur_im, rows, chunks, plan, cyc):
     """Same recursion as _f6_rec but with Scale+T2 fused (store_t=True on
     bailey_scale_kernel) and FFT-m_0+T3 fused (store_t=True, M=M on the inner
     FFT kernel). Output should be bitwise-equal to _f6_rec.
-
-    TODO: implement.
     """
-    raise NotImplementedError("TODO: implement _f7_rec")
+    m0 = chunks[0]
+    if len(chunks) == 1:
+        out_re, out_im = cyc.next()
+        _fft_chunk(cur_re, cur_im, out_re, out_im, rows, m0, plan)
+        return out_re, out_im
+
+    M = math.prod(chunks[1:])
+    N_i = m0 * M
+
+    t1_re, t1_im = cyc.next()
+    _transpose(cur_re, cur_im, t1_re, t1_im, rows, M, m0)
+
+    rec_re, rec_im = _f7_rec(t1_re, t1_im, rows * m0, chunks[1:], plan, cyc)
+
+    twr, twi = _lookup_tw(plan, m0, M, N_i)
+    sc_re, sc_im = cyc.next()
+    _scale(rec_re, rec_im, sc_re, sc_im, rows, m0, M, twr, twi, store_t=True)
+
+    fft_re, fft_im = cyc.next()
+    _fft_chunk(sc_re, sc_im, fft_re, fft_im, rows * M, m0, plan, M=M, store_t=True)
+
+    return fft_re, fft_im
